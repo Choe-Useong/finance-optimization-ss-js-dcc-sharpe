@@ -223,39 +223,30 @@ from mgarch import mgarch
 from tqdm import tqdm
 
 
-def rolling_dcc_garch(returns_df, window=500, step=5, dist='t'):
-    cov_list = []
-    idx_list = []
-
-    start = window
-    end_total = len(returns_df)
-
-    # 초기 fit
+def rolling_dcc_garch(returns_df, window=252, step=5, dist='t'):
+    cov_list, idx_list = [], []
     model = mgarch(dist=dist)
+
+    # 초기 적합(0~window-1)
     model.fit(returns_df.iloc[:window].values)
-    last_date_idx = window - 1
-
-    # 첫 예측
     pred = model.predict(1)
-    cov_t = pd.DataFrame(pred['cov'], index=returns_df.columns, columns=returns_df.columns)
-    cov_list.append(cov_t)
-    idx_list.append(returns_df.index[last_date_idx])
+    cov_list.append(pd.DataFrame(pred['cov'], index=returns_df.columns, columns=returns_df.columns))
+    idx_list.append(returns_df.index[window])  # t+1에 붙임
 
-    # step 간격 반복
-    for end in tqdm(range(window, end_total), desc="Rolling DCC-GARCH Daily Fit", unit="day"):
-        # step 주기마다 모델 재학습
-        if (end - window) % step == 0:
-            sub_data = returns_df.iloc[end - window:end].values
-            model = mgarch(dist=dist)
-            model.fit(sub_data)
-            print(f"[DEBUG] Model refitted on rows {end-window} ~ {end-1}")
+    last_refit = window - 1
+    for t in range(window, len(returns_df) - 1):
+        # 매일 새 데이터까지는 최소 '상태'가 갱신되어야 함
+        if (t - last_refit) >= step:
+            sub = returns_df.iloc[t-window+1:t+1].values  # 새 r_t 포함해서 재적합
+            model = mgarch(dist=dist); model.fit(sub)
+            last_refit = t
+        else:
+            # 라이브러리에 상태 업데이트가 없으면 step=1 권장
+            pass
 
-        # 오늘 예측값 추가
         pred = model.predict(1)
-        cov_t = pd.DataFrame(pred['cov'], index=returns_df.columns, columns=returns_df.columns)
-        cov_list.append(cov_t)
-        idx_list.append(returns_df.index[end])
-
+        cov_list.append(pd.DataFrame(pred['cov'], index=returns_df.columns, columns=returns_df.columns))
+        idx_list.append(returns_df.index[t+1])  # 항상 t+1
     return pd.Series(cov_list, index=idx_list)
 
 
