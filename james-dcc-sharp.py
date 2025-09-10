@@ -10,8 +10,8 @@ matplotlib.use('TkAgg')  # 서버 환경에서 matplotlib 사용 시 필요
 
 
 
-def download_prices(tickers, start, end):
-    price = yf.download(tickers, start=start, end=end, interval = '1d')['Close'].dropna()
+def download_prices(tickers, start, end, interval="1d"):
+    price = yf.download(tickers, start=start, end=end, interval=interval)['Close']
     return price.dropna()
 
 
