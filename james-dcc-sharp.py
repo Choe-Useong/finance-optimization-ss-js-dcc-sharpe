@@ -10,8 +10,8 @@ matplotlib.use('TkAgg')  # 서버 환경에서 matplotlib 사용 시 필요
 
 
 
-def download_prices(tickers, start, end, interval="1d"):
-    price = yf.download(tickers, start=start, end=end, interval=interval)['Close']
+def download_prices(tickers, start, end):
+    price = yf.download(tickers, start=start, end=end, interval = '1d')['Close'].dropna()
     return price.dropna()
 
 
@@ -90,6 +90,9 @@ def estimate_dynamic_mu(
         results[ticker] = res
 
     return filtered_mu, filtered_var, results
+
+
+
 
 
 
@@ -197,99 +200,68 @@ def subtract_risk_free_from_mu(
     return mu_excess_df
 
 
-
-
-
-def ewma_shrink_cov(returns_df, lam=0.94, shrink_lambda=0.0):
-    T, N = returns_df.shape
-    S = returns_df.cov().values
-    cov_list = []
-    for t in range(T):
-        r = returns_df.iloc[t].values.reshape(-1, 1)
-        S = lam * S + (1 - lam) * (r @ r.T)
-        target = constant_correlation_target(S)
-        S_shrink = shrink_lambda * target + (1 - shrink_lambda) * S
-        cov_list.append(pd.DataFrame(S_shrink,
-                                     index=returns_df.columns,
-                                     columns=returns_df.columns))
-    return cov_list
-
-
-
-
-
-
-from mgarch import mgarch
+from my_mgarch import mgarch
 from tqdm import tqdm
 
+def rolling_dcc_garch(
+    returns_df: pd.DataFrame,
+    mean_df: pd.DataFrame | None = None,   # ← (선택) 하루 앞 평균예측 m_{t|t-1} 소스
+    window: int = 252,
+    step: int = 25,
+    dist: str = 'norm',
+    label: str = 'target'                  # 'target'이면 t+1 날짜에 라벨
+) -> pd.Series:
+    """
+    반환: pd.Series[target_date] of (N×N) 공분산 DataFrame.
+    - 25일마다: 최근 252일로 model.fit(...)  → 파라미터 갱신
+    - 그 사이: model.update_one(r_t, mean_pred) → 상태 갱신 후 t+1 공분산
+    """
+    if returns_df.isna().any().any():
+        raise ValueError("returns_df에 NaN이 있으면 업데이트가 불안정합니다. 사전 처리하세요.")
+    cols = list(returns_df.columns)
+    T, N = len(returns_df), len(cols)
+    if window >= T - 1:
+        raise ValueError("window는 전체 길이-1보다 작아야 합니다.")
 
-def rolling_dcc_garch(returns_df, window=252, step=5, dist='t'):
-    cov_list, idx_list = [], []
+    # ── 평균예측 소스 준비(정보누수 방지: 반드시 1일 시프트해서 씀) ─────────
+    if mean_df is not None:
+        # mean_df는 t 시점 추정치이므로 t+1 예측에 쓰려면 1일 시프트
+        mean_src = mean_df.shift(1).reindex(returns_df.index)
+    else:
+        mean_src = None
+
+    # ── 초기 적합: [0, window) → 상태 초기화 ───────────────────────────────
     model = mgarch(dist=dist)
-
-    # 초기 적합(0~window-1)
     model.fit(returns_df.iloc[:window].values)
-    pred = model.predict(1)
-    cov_list.append(pd.DataFrame(pred['cov'], index=returns_df.columns, columns=returns_df.columns))
-    idx_list.append(returns_df.index[window])  # t+1에 붙임
 
-    last_refit = window - 1
-    for t in range(window, len(returns_df) - 1):
-        # 매일 새 데이터까지는 최소 '상태'가 갱신되어야 함
-        if (t - last_refit) >= step:
-            sub = returns_df.iloc[t-window+1:t+1].values  # 새 r_t 포함해서 재적합
-            model = mgarch(dist=dist); model.fit(sub)
-            last_refit = t
-        else:
-            # 라이브러리에 상태 업데이트가 없으면 step=1 권장
-            pass
+    cov_list, idx_list = [], []
 
-        pred = model.predict(1)
-        cov_list.append(pd.DataFrame(pred['cov'], index=returns_df.columns, columns=returns_df.columns))
-        idx_list.append(returns_df.index[t+1])  # 항상 t+1
-    return pd.Series(cov_list, index=idx_list)
+    # 첫 예측: 정보시점 = window-1 → 대상일 = window
+    first_pred = model.predict(1)
+    H = np.asarray(first_pred['cov'], dtype=float)
+    cov_list.append(pd.DataFrame(H, index=cols, columns=cols))
+    idx_list.append(returns_df.index[window] if label == 'target' else returns_df.index[window-1])
 
+    # ── 메인 루프: t = window .. T-2  (항상 t+1을 예측·라벨링) ───────────────
+    for t in tqdm(range(window, T - 1), desc="Rolling DCC-GARCH (fit 25d, daily update)", unit="day"):
+        # 1) 25일마다 파라미터 재적합(롤링 252일)
+        if ((t - window + 1) % step) == 0:
+            start = t - window + 1
+            sub = returns_df.iloc[start:t+1].values
+            model = mgarch(dist=dist)
+            model.fit(sub)
 
+        # 2) 오늘 관측 r_t와 평균예측 m_{t|t-1}로 상태 업데이트 → H_{t+1|t}
+        r_t = returns_df.iloc[t].values
+        m_t = None if mean_src is None else mean_src.iloc[t].values
+        pred = model.update_one(r_t, mean_pred=m_t)
+        H_next = np.asarray(pred['cov'], dtype=float)
 
+        cov_list.append(pd.DataFrame(H_next, index=cols, columns=cols))
+        idx_list.append(returns_df.index[t+1] if label == 'target' else returns_df.index[t])
 
+    return pd.Series(cov_list, index=pd.Index(idx_list, name=label), dtype=object)
 
-
-def ewma_cov_with_initial_sample(returns_df: pd.DataFrame, lam: float = 0.94, init_window: int = 25) -> list[pd.DataFrame]:
-    """
-    초기 25개 샘플로 공분산 초기화 후, 이후 EWMA로 누수 없이 시점별 공분산 추정
-
-    Parameters
-    ----------
-    returns_df : pd.DataFrame
-        수익률 데이터프레임 (T x N)
-    lam : float
-        EWMA lambda 계수 (default=0.94)
-    init_window : int
-        초기 샘플 공분산을 계산할 관측치 수 (default=25)
-
-    Returns
-    -------
-    cov_list : list[pd.DataFrame]
-        시점별 공분산 추정값 리스트
-    """
-    T, N = returns_df.shape
-    cov_list = []
-
-    # 1. 초기화 구간보다 짧으면 계산 불가
-    if T < init_window:
-        raise ValueError("init_window보다 데이터 길이가 더 길어야 합니다.")
-
-    # 2. 초기 공분산: 첫 25개 샘플로 계산
-    S = returns_df.iloc[:init_window].cov().values
-
-    # 3. init_window 시점부터 EWMA 재귀 시작
-    for t in range(init_window, T):
-        r = returns_df.iloc[t].values.reshape(-1, 1)
-        S = lam * S + (1 - lam) * (r @ r.T)
-        cov_df = pd.DataFrame(S, index=returns_df.columns, columns=returns_df.columns)
-        cov_list.append(cov_df)
-
-    return cov_list
 
 
 
@@ -318,7 +290,7 @@ def optimize_weights(mu, cov, objective='sharpe', ridge=1e-3, sum_to_one=True):
 
     bounds = [(0, 1)] * N if sum_to_one else [(0, None)] * N
 
-    # 비중합 = 1 제약 여부
+    # ✅ 비중합 = 1 제약 여부
     if sum_to_one:
         cons = ({'type': 'eq', 'fun': lambda w: w.sum() - 1},)
     else:
@@ -328,11 +300,6 @@ def optimize_weights(mu, cov, objective='sharpe', ridge=1e-3, sum_to_one=True):
 
     res = minimize(obj, w0, method='SLSQP', bounds=bounds, constraints=cons)
     return pd.Series(res.x if res.success else np.full(N, np.nan), index=mu.index)
-
-
-
-
-
 
 
 
@@ -380,15 +347,11 @@ mu_shrunk.iloc[:25] = np.nan
 mu_shrunk= mu_shrunk.dropna()
 
 
-
 # 3. 확장 DCC-GARCH 공분산
 dcc_cov_series = rolling_dcc_garch(log_returns, window=252, step=25, dist='t')
 
 # 4. mu_shrunk와 날짜 맞춤
 mu_for_opt = mu_shrunk.loc[dcc_cov_series.index]
-
-cov_series = ewma_cov_with_initial_sample(log_returns, lam=0.94)
-
 
 #sharpe_weights = rolling_portfolio_weights(mu_shrunk, cov_series, objective='sharpe', ridge= 0.1)
 #kelly_weights = rolling_portfolio_weights(mu_shrunk, cov_series, objective='kelly', ridge= 0.0)
